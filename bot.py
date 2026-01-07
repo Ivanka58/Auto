@@ -12,6 +12,15 @@ import vk_api
 # Загрузка переменных из .env (если работаем локально)
 load_dotenv()
 
+app = Flask(__name__)
+@app.route('/')
+def health_check():
+    return "Bot is alive!", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
 # Чтение конфигурации
 TG_TOKEN = os.getenv("TG_TOKEN")
 VK_TOKEN = os.getenv("VK_TOKEN")
@@ -123,6 +132,9 @@ async def final_post(message: types.Message, state: FSMContext):
         await message.answer(f"Произошла критическая ошибка: {e}\nОбратись к администратору @Ivanka58", reply_markup=get_start_kb())
 
     await state.finish()
+
+# Запускаем Flask в отдельном потоке
+    threading.Thread(target=run_flask).start()
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
