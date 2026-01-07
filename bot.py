@@ -1,140 +1,123 @@
 import os
-import asyncio
-import logging
-from aiogram import Bot, Dispatcher, types, executor
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+import telebot
+from telebot import types
+from flask import Flask
+import threading
 from dotenv import load_dotenv
-import vk_api
+from vk_worker import send_to_vk_groups
 
-# Загрузка переменных из .env (если работаем локально)
 load_dotenv()
 
+# Настройки из ENV
+TOKEN = os.getenv("TG_TOKEN")
+VK_TOKEN = os.getenv("VK_TOKEN")
+GROUPS_RAW = os.getenv("GROUP_IDS", "")
+GROUP_IDS = [int(i.strip()) for i in GROUPS_RAW.split(",") if i.strip()]
+
+bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
+
+# Словарь для хранения данных пользователя (вместо FSM)
+user_data = {}
+
+# --- СЕРВЕР ДЛЯ ПОРТА ---
 @app.route('/')
-def health_check():
-    return "Bot is alive!", 200
+def health():
+    return "Bot is alive", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# Чтение конфигурации
-TG_TOKEN = os.getenv("TG_TOKEN")
-VK_TOKEN = os.getenv("VK_TOKEN")
-# Превращаем строку "-123,-456" в список чисел [-123, -456]
-GROUPS_STR = os.getenv("GROUP_IDS", "")
-GROUP_IDS = [int(i.strip()) for i in GROUPS_STR.split(",") if i.strip()]
-
-logging.basicConfig(level=logging.INFO)
-
-bot = Bot(token=TG_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(bot, storage=storage)
-
-# Состояния
-class AdFlow(StatesGroup):
-    waiting_for_photo = State()
-    waiting_for_text = State()
-    confirm = State()
-
-# Клавиатуры
+# --- КЛАВИАТУРЫ ---
 def get_start_kb():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("Отправить объявление"))
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(types.KeyboardButton("Отправить объявление"))
     return kb
 
 def get_confirm_kb():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("Готово ☑️"), KeyboardButton("Изменить"))
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(types.KeyboardButton("Готово ☑️"), types.KeyboardButton("Изменить"))
     return kb
 
-# Общая функция приветствия
-async def send_welcome(message: types.Message):
-    text = "Привет Захар, чтобы отправить объявление нажми ниже 👇"
-    await message.answer(text, reply_markup=get_start_kb())
+# --- КОМАНДЫ ---
+@bot.message_handler(commands=['start', 'avto'])
+def send_welcome(message):
+    user_data[message.chat.id] = {} # Сброс данных
+    bot.send_message(
+        message.chat.id, 
+        "Привет Захар, чтобы отправить объявление нажми ниже 👇", 
+        reply_markup=get_start_kb()
+    )
 
-@dp.message_handler(commands=['start', 'avto'])
-async def cmd_start(message: types.Message):
-    await send_welcome(message)
+@bot.message_handler(func=lambda m: m.text == "Отправить объявление")
+def ask_photo(message):
+    bot.send_message(message.chat.id, "Отправь фото твоего объявления", reply_markup=types.ReplyKeyboardRemove())
+    bot.register_next_step_handler(message, get_photo)
 
-@dp.message_handler(lambda m: m.text == "Отправить объявление", state="*")
-async def start_ad_process(message: types.Message):
-    await message.answer("Отправь фото твоего объявления", reply_markup=types.ReplyKeyboardRemove())
-    await AdFlow.waiting_for_photo.set()
+def get_photo(message):
+    if not message.photo:
+        bot.send_message(message.chat.id, "Это не фото! Нажми /start и попробуй снова.")
+        return
+    
+    # Сохраняем самое лучшее качество фото
+    file_id = message.photo[-1].file_id
+    user_data[message.chat.id]['photo_id'] = file_id
+    
+    bot.send_message(message.chat.id, "Теперь отправь текст к фото")
+    bot.register_next_step_handler(message, get_text)
 
-@dp.message_handler(content_types=['photo'], state=AdFlow.waiting_for_photo)
-async def process_photo(message: types.Message, state: FSMContext):
-    # Сохраняем ID самого качественного фото
-    photo_id = message.photo[-1].file_id
-    await state.update_data(photo_id=photo_id)
-    await message.answer("Теперь отправь текст к фото")
-    await AdFlow.waiting_for_text.set()
-
-@dp.message_handler(state=AdFlow.waiting_for_text)
-async def process_text(message: types.Message, state: FSMContext):
-    await state.update_data(ad_text=message.text)
-    await message.answer(
-
-        "Точно уверен? В тексте все четко? Ничего изменить не хочешь?",
+def get_text(message):
+    if not message.text:
+        bot.send_message(message.chat.id, "Нужен текст! Нажми /start и попробуй снова.")
+        return
+    
+    user_data[message.chat.id]['text'] = message.text
+    bot.send_message(
+        message.chat.id, 
+        "Точно уверен? В тексте все четко? Ничего изменить не хочешь?", 
         reply_markup=get_confirm_kb()
     )
-    await AdFlow.confirm.set()
 
-@dp.message_handler(lambda m: m.text == "Изменить", state=AdFlow.confirm)
-async def restart_flow(message: types.Message):
-    await start_ad_process(message)
-
-@dp.message_handler(lambda m: m.text == "Готово ☑️", state=AdFlow.confirm)
-async def final_post(message: types.Message, state: FSMContext):
-    if not VK_TOKEN:
-        await message.answer("Ключ вк не подключен!! Обратись к администратору @Ivanka58", reply_markup=get_start_kb())
-        await state.finish()
+@bot.message_handler(func=lambda m: m.text in ["Готово ☑️", "Изменить"])
+def confirm_step(message):
+    if message.text == "Изменить":
+        ask_photo(message)
         return
 
-    data = await state.get_data()
-    photo_id = data.get("photo_id")
-    ad_text = data.get("ad_text")
+    # Если Готово
+    chat_id = message.chat.id
+    if not VK_TOKEN:
+        bot.send_message(chat_id, "Ключ вк не подключен!! Обратись к администратору @Ivanka58", reply_markup=get_start_kb())
+        return
 
-    await message.answer("Начинаю процесс отправки... подожди.")
+    bot.send_message(chat_id, "Начинаю процесс отправки... подожди.")
 
     try:
-        # Авторизация в ВК
-        vk_session = vk_api.VkApi(token=VK_TOKEN)
-        vk = vk_session.get_api()
-        upload = vk_api.VkUpload(vk_session)
+        data = user_data.get(chat_id, {})
+        # Скачивание
+        file_info = bot.get_file(data['photo_id'])
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        photo_path = f"img_{chat_id}.jpg"
+        with open(photo_path, 'wb') as new_file:
+            new_file.write(downloaded_file)
 
-        # Скачиваем фото из ТГ
-        photo_file = await bot.get_file(photo_id)
-        photo_name = "temp_car.jpg"
-        await bot.download_file(photo_file.file_path, photo_name)
+        # Отправка в ВК
+        report = send_to_vk_groups(VK_TOKEN, GROUP_IDS, data['text'], photo_path)
 
-        # Загружаем в ВК
-        vk_photo = upload.photo_wall(photo_name)[0]
-        attachment = f"photo{vk_photo['owner_id']}_{vk_photo['id']}"
-        os.remove(photo_name) # Удаляем временный файл
+        # Удаление мусора
+        if os.path.exists(photo_path):
+            os.remove(photo_path)
 
-        results = []
-        for g_id in GROUP_IDS:
-            try:
-                vk.wall.post(owner_id=g_id, message=ad_text, attachments=attachment)
-                results.append(f"Группа {g_id}: Отправлено")
-            except Exception as e:
-                results.append(f"Группа {g_id}: Ошибка, группа закрыта, обратись к администратору @Ivanka58")
-            
-            await asyncio.sleep(2) # Защита от спам-фильтра ВК
-
-        await message.answer("\n".join(results), reply_markup=get_start_kb())
-
+        bot.send_message(chat_id, report, reply_markup=get_start_kb())
     except Exception as e:
-        await message.answer(f"Произошла критическая ошибка: {e}\nОбратись к администратору @Ivanka58", reply_markup=get_start_kb())
+        bot.send_message(chat_id, f"Ошибка: {e}\nОбратись к администратору @Ivanka58", reply_markup=get_start_kb())
 
-    await state.finish()
-
-# Запускаем Flask в отдельном потоке
-    threading.Thread(target=run_flask).start()
-
+# --- ЗАПУСК ---
 if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True)
+    # Flask в потоке для Render
+    threading.Thread(target=run_flask).start()
+    # Бот
+    print("Бот запущен...")
+    bot.infinity_polling()
